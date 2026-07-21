@@ -1,0 +1,17 @@
+# 依赖包（体积巨大，不需要上传，部署时自动安装）
+node_modules/
+
+# Next.js 构建缓存
+.next/
+
+# 静态导出产物（GitHub 上不需要，Cloudflare 会自动构建）
+out/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 环境变量（包含敏感信息，绝对不能上传）
+.env
+.env.local
+.env.production
