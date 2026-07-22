@@ -1,9 +1,6 @@
 name = "llms-txt-system"
-main = ".vercel/output/static/index.html"
 compatibility_date = "2024-12-18"
 
 [build]
 command = "npm run build"
-
-[env.production]
-vars = { NODE_VERSION = "18" }
+directory = "out"
