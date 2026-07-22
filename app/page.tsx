@@ -47,7 +47,7 @@ interface ScrapeResult {
 }
 
 /** SEO 审计类别 */
-type SeoAuditCategory = "meta" | "content" | "technical" | "performance";
+type SeoAuditCategory = "meta" | "content" | "technical" | "performance" | "china";
 
 /** SEO 审计检查项 */
 interface SeoAuditItem {
@@ -295,6 +295,7 @@ const AUDIT_CATEGORY_LABELS: Record<SeoAuditCategory, string> = {
   content: "内容质量",
   technical: "技术优化",
   performance: "性能与体验",
+  china: "国内市场专属",
 };
 
 /**
@@ -478,6 +479,95 @@ function runSeoAudit(html: string, url: string): SeoAuditReport {
     items.push({ id: "perf-resources", category: "performance", label: "外部资源数量", detail: `共 ${totalResources} 个外部资源（CSS ${stylesheets.length}，JS ${scripts.length}），请求过多可能影响加载速度。`, status: "warning" });
   } else {
     items.push({ id: "perf-resources", category: "performance", label: "外部资源数量", detail: `共 ${totalResources} 个外部资源（CSS ${stylesheets.length}，JS ${scripts.length}），数量合理。`, status: "pass" });
+  }
+
+  // ── 5. 国内市场专属检查 ──
+
+  // ICP 备案检测
+  const pageText = doc.body?.textContent || "";
+  const icpMatch = pageText.match(/[京沪粤津渝冀苏浙皖闽赣鲁豫鄂湘川陕甘宁青新藏桂蒙辽吉黑云贵海南内]\w*ICP[备号]\d+/);
+  const footerEl = doc.querySelector("footer") || doc.querySelector(".footer");
+  const footerText = footerEl?.textContent || "";
+  const hasIcpInFooter = /[京沪粤津渝冀苏浙皖闽赣鲁豫鄂湘川陕甘宁青新藏桂蒙辽吉黑云贵海南内]\w*ICP[备号]\d+/.test(footerText);
+  const hasIcpAnywhere = !!icpMatch || hasIcpInFooter;
+  if (hasIcpAnywhere) {
+    const icpNumber = icpMatch?.[0] || footerText.match(/[京沪粤津渝冀苏浙皖闽赣鲁豫鄂湘川陕甘宁青新藏桂蒙辽吉黑云贵海南内]\w*ICP[备号]\d+/)?.[0] || "";
+    items.push({ id: "china-icp", category: "china", label: "ICP 备案", detail: `检测到 ICP 备案号：${icpNumber}，符合中国大陆网站运营合规要求。`, status: "pass" });
+  } else {
+    items.push({ id: "china-icp", category: "china", label: "ICP 备案", detail: "未在页面中检测到 ICP 备案号。面向中国大陆用户的网站需在页脚展示 ICP 备案信息，否则可能面临搜索引擎降权或关站风险。", status: "fail" });
+  }
+
+  // 百度搜索验证
+  const baiduVerify = doc.querySelector("meta[name='baidu-site-verification']")?.getAttribute("content") || "";
+  if (baiduVerify) {
+    items.push({ id: "china-baidu", category: "china", label: "百度搜索验证", detail: `已配置百度站长验证（${baiduVerify.slice(0, 20)}...），可在百度搜索资源平台提交 sitemap 和监控收录。`, status: "pass" });
+  } else {
+    items.push({ id: "china-baidu", category: "china", label: "百度搜索验证", detail: "缺少百度站长验证标签（baidu-site-verification），无法在百度搜索资源平台管理站点收录和索引。", status: "warning" });
+  }
+
+  // 搜狗搜索验证
+  const sogouVerify = doc.querySelector("meta[name='sogou_site_verification']")?.getAttribute("content") || "";
+  if (sogouVerify) {
+    items.push({ id: "china-sogou", category: "china", label: "搜狗搜索验证", detail: `已配置搜狗站长验证（${sogouVerify.slice(0, 20)}...），可在搜狗站长平台提交链接。`, status: "pass" });
+  } else {
+    items.push({ id: "china-sogou", category: "china", label: "搜狗搜索验证", detail: "缺少搜狗站长验证标签（sogou_site_verification），建议在搜狗站长平台添加站点以改善收录。", status: "warning" });
+  }
+
+  // 360 搜索验证
+  const verify360 = doc.querySelector("meta[name='360-site-verification']")?.getAttribute("content") || "";
+  if (verify360) {
+    items.push({ id: "china-360", category: "china", label: "360 搜索验证", detail: `已配置 360 站长验证（${verify360.slice(0, 20)}...），可在 360 站长平台管理站点。`, status: "pass" });
+  } else {
+    items.push({ id: "china-360", category: "china", label: "360 搜索验证", detail: "缺少 360 站长验证标签（360-site-verification），建议在 360 站长平台添加站点。", status: "warning" });
+  }
+
+  // 神马搜索验证
+  const shenmaVerify = doc.querySelector("meta[name='shenma-site-verification']")?.getAttribute("content") || "";
+  if (shenmaVerify) {
+    items.push({ id: "china-shenma", category: "china", label: "神马搜索验证", detail: `已配置神马站长验证（${shenmaVerify.slice(0, 20)}...），可在神马搜索平台管理移动端收录。`, status: "pass" });
+  } else {
+    items.push({ id: "china-shenma", category: "china", label: "神马搜索验证", detail: "缺少神马站长验证标签（shenma-site-verification），神马是 UC 浏览器默认搜索引擎，移动端流量重要来源。", status: "warning" });
+  }
+
+  // 站点地图引用检测
+  const sitemapLink = doc.querySelector("link[rel='sitemap']")?.getAttribute("href") || "";
+  const robotsTxtSitemap = false; // 无法直接 fetch robots.txt，仅检测页面内引用
+  const hasSitemapRef = !!sitemapLink || !!robotsTxtSitemap;
+  if (hasSitemapRef) {
+    items.push({ id: "china-sitemap", category: "china", label: "站点地图引用", detail: `检测到 sitemap 引用：${sitemapLink || "robots.txt 中已声明"}，有利于搜索引擎发现和索引页面。`, status: "pass" });
+  } else {
+    items.push({ id: "china-sitemap", category: "china", label: "站点地图引用", detail: "页面未引用 sitemap.xml。建议在 robots.txt 中声明 Sitemap 路径，并在百度/搜狗站长平台主动提交，加速收录。", status: "warning" });
+  }
+
+  // 中文语言声明检测
+  const langAttr2 = doc.documentElement.getAttribute("lang") || "";
+  if (langAttr2 === "zh-CN" || langAttr2 === "zh-cn" || langAttr2 === "zh") {
+    items.push({ id: "china-lang", category: "china", label: "中文语言声明", detail: `语言声明为 lang="${langAttr2}"，符合中文网站最佳实践，有助于搜索引擎和浏览器正确识别语言。`, status: "pass" });
+  } else if (langAttr2) {
+    items.push({ id: "china-lang", category: "china", label: "中文语言声明", detail: `当前 lang="${langAttr2}"，面向国内用户建议改为 lang="zh-CN" 以确保搜索引擎和浏览器正确识别为中文页面。`, status: "warning" });
+  } else {
+    items.push({ id: "china-lang", category: "china", label: "中文语言声明", detail: "缺少 lang 属性，面向国内用户建议设置 lang=\"zh-CN\"。", status: "warning" });
+  }
+
+  // 微信分享优化检测
+  const wxShareTags = {
+    "weixin:article": doc.querySelector("meta[property='weixin:article']")?.getAttribute("content") || "",
+    "weixin:type": doc.querySelector("meta[property='weixin:type']")?.getAttribute("content") || "",
+  };
+  // 微信分享主要依赖 Open Graph，检测 OG + 微信专用标签完整度
+  const ogImage = doc.querySelector("meta[property='og:image']")?.getAttribute("content") || "";
+  const ogTitle2 = doc.querySelector("meta[property='og:title']")?.getAttribute("content") || "";
+  const ogDesc2 = doc.querySelector("meta[property='og:description']")?.getAttribute("content") || "";
+  const wxReady = ogImage && ogTitle2 && ogDesc2;
+  const wxSpecificCount = Object.values(wxShareTags).filter((v) => v).length;
+  if (wxReady && wxSpecificCount > 0) {
+    items.push({ id: "china-wechat", category: "china", label: "微信分享优化", detail: `Open Graph 标签完整 + 微信专用标签 ${wxSpecificCount} 个，微信内分享预览效果最佳。`, status: "pass" });
+  } else if (wxReady) {
+    items.push({ id: "china-wechat", category: "china", label: "微信分享优化", detail: "Open Graph 标签完整，微信分享可正常展示标题、描述和图片。建议补充微信专用标签以获得更好体验。", status: "pass" });
+  } else if (ogTitle2 || ogDesc2 || ogImage) {
+    items.push({ id: "china-wechat", category: "china", label: "微信分享优化", detail: `Open Graph 标签不完整（缺少 ${!ogTitle2 ? "og:title " : ""}${!ogDesc2 ? "og:description " : ""}${!ogImage ? "og:image" : ""}），微信分享时预览信息缺失。`, status: "warning" });
+  } else {
+    items.push({ id: "china-wechat", category: "china", label: "微信分享优化", detail: "缺少 Open Graph 标签，微信内分享时无法展示标题、描述和预览图，严重影响分享点击率。", status: "fail" });
   }
 
   // ── 计算评分 ──
@@ -1088,7 +1178,7 @@ export default function HomePage() {
                       {showSeoReport && (
                         <div className="border-t border-slate-100 px-5 py-4">
                           {/* 按类别分组 */}
-                          {(["meta", "content", "technical", "performance"] as SeoAuditCategory[]).map((cat) => {
+                          {(["meta", "content", "technical", "performance", "china"] as SeoAuditCategory[]).map((cat) => {
                             const catItems = seoReport.items.filter((i) => i.category === cat);
                             if (catItems.length === 0) return null;
                             return (
