@@ -35,6 +35,41 @@ interface ProjectConfig {
   author: string;
 }
 
+/** 网页抓取状态 */
+type ScrapeStatus = "idle" | "loading" | "success" | "error";
+
+/** 抓取结果 */
+interface ScrapeResult {
+  title: string;
+  description: string;
+  content: string;
+  url: string;
+}
+
+/** SEO 审计类别 */
+type SeoAuditCategory = "meta" | "content" | "technical" | "performance";
+
+/** SEO 审计检查项 */
+interface SeoAuditItem {
+  id: string;
+  category: SeoAuditCategory;
+  label: string;
+  detail: string;
+  status: ValidationStatus;
+}
+
+/** SEO 审计报告 */
+interface SeoAuditReport {
+  score: number;
+  items: SeoAuditItem[];
+  summary: {
+    pass: number;
+    warning: number;
+    fail: number;
+    total: number;
+  };
+}
+
 // ─────────────────────────────────────────────────────────────
 // 常量与演示数据
 // ─────────────────────────────────────────────────────────────
@@ -77,8 +112,387 @@ const DEFAULT_CONFIG: ProjectConfig = {
 };
 
 // ─────────────────────────────────────────────────────────────
-// 工具函数：llms.txt 生成与校验
+// 工具函数：网页抓取与 HTML 转文本
 // ─────────────────────────────────────────────────────────────
+
+/** CORS 代理服务列表（依次尝试，提高可用性） */
+const CORS_PROXIES = [
+  (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  (url: string) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+  (url: string) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(url)}`,
+];
+
+/**
+ * 从 HTML 中提取标题、描述和正文文本
+ * 使用浏览器内置的 DOMParser 解析 HTML，去除脚本和样式，提取结构化内容
+ */
+function parseHtmlToContent(html: string): ScrapeResult {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, "text/html");
+
+  // 提取标题
+  const title =
+    doc.querySelector("meta[property='og:title']")?.getAttribute("content") ||
+    doc.querySelector("title")?.textContent ||
+    doc.querySelector("h1")?.textContent ||
+    "未命名页面";
+
+  // 提取描述
+  const description =
+    doc.querySelector("meta[name='description']")?.getAttribute("content") ||
+    doc.querySelector("meta[property='og:description']")?.getAttribute("content") ||
+    "";
+
+  // 移除不需要的标签
+  const removeTags = ["script", "style", "nav", "footer", "header", "aside", "iframe", "noscript", "svg", "form"];
+  for (const tag of removeTags) {
+    doc.querySelectorAll(tag).forEach((el) => el.remove());
+  }
+
+  // 优先提取 main / article 内容，其次取 body
+  const contentRoot =
+    doc.querySelector("main") ||
+    doc.querySelector("article") ||
+    doc.querySelector("#content") ||
+    doc.querySelector(".content") ||
+    doc.body;
+
+  if (!contentRoot) {
+    return { title, description, content: "", url: "" };
+  }
+
+  // 将 HTML 转换为结构化文本
+  const lines: string[] = [];
+
+  /** 递归遍历 DOM 节点，提取文本 */
+  function walkNode(node: Node, depth: number = 0) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent?.trim();
+      if (text) {
+        lines.push(text);
+      }
+      return;
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+    const el = node as Element;
+    const tagName = el.tagName.toLowerCase();
+
+    // 标题转换为 Markdown 格式
+    if (/^h[1-6]$/.test(tagName)) {
+      const level = parseInt(tagName[1]);
+      const prefix = "#".repeat(level);
+      const text = el.textContent?.trim();
+      if (text) {
+        lines.push("");
+        lines.push(`${prefix} ${text}`);
+        lines.push("");
+      }
+      return;
+    }
+
+    // 列表处理
+    if (tagName === "li") {
+      const text = el.textContent?.trim();
+      if (text) {
+        lines.push(`- ${text}`);
+      }
+      return;
+    }
+
+    // 段落处理
+    if (tagName === "p") {
+      const text = el.textContent?.trim();
+      if (text) {
+        lines.push("");
+        lines.push(text);
+        lines.push("");
+      }
+      return;
+    }
+
+    // 链接处理
+    if (tagName === "a") {
+      const href = el.getAttribute("href");
+      const text = el.textContent?.trim();
+      if (text && href) {
+        lines.push(`[${text}](${href})`);
+      } else if (text) {
+        lines.push(text);
+      }
+      return;
+    }
+
+    // 代码块处理
+    if (tagName === "pre" || tagName === "code") {
+      const text = el.textContent?.trim();
+      if (text) {
+        lines.push("");
+        lines.push("```");
+        lines.push(text);
+        lines.push("```");
+        lines.push("");
+      }
+      return;
+    }
+
+    // 引用块处理
+    if (tagName === "blockquote") {
+      const text = el.textContent?.trim();
+      if (text) {
+        lines.push("");
+        lines.push(`> ${text}`);
+        lines.push("");
+      }
+      return;
+    }
+
+    // 表格处理：简化为逐行文本
+    if (tagName === "table") {
+      const rows = el.querySelectorAll("tr");
+      rows.forEach((row) => {
+        const cells = Array.from(row.querySelectorAll("th, td"));
+        const cellTexts = cells.map((c) => c.textContent?.trim() || "");
+        if (cellTexts.some((t) => t)) {
+          lines.push(`| ${cellTexts.join(" | ")} |`);
+        }
+      });
+      lines.push("");
+      return;
+    }
+
+    // 换行处理
+    if (tagName === "br") {
+      lines.push("");
+      return;
+    }
+
+    // 递归处理子节点
+    for (const child of Array.from(el.childNodes)) {
+      walkNode(child, depth + 1);
+    }
+  }
+
+  walkNode(contentRoot);
+
+  // 清理多余的空行
+  const cleanedContent = lines
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return { title, description, content: cleanedContent, url: "" };
+}
+
+// ─────────────────────────────────────────────────────────────
+// 工具函数：SEO 审计
+// ─────────────────────────────────────────────────────────────
+
+/** 审计类别中文名 */
+const AUDIT_CATEGORY_LABELS: Record<SeoAuditCategory, string> = {
+  meta: "Meta 标签",
+  content: "内容质量",
+  technical: "技术优化",
+  performance: "性能与体验",
+};
+
+/**
+ * 对抓取到的 HTML 执行 SEO 审计，生成诊断报告
+ * 检查范围：Meta 标签、标题结构、图片、链接、结构化数据、移动端适配等
+ */
+function runSeoAudit(html: string, url: string): SeoAuditReport {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, "text/html");
+  const items: SeoAuditItem[] = [];
+
+  // ── 1. Meta 标签检查 ──
+
+  // Title 标签
+  const titleEl = doc.querySelector("title");
+  const titleText = titleEl?.textContent?.trim() || "";
+  const ogTitle = doc.querySelector("meta[property='og:title']")?.getAttribute("content") || "";
+  if (!titleText) {
+    items.push({ id: "meta-title", category: "meta", label: "Title 标签", detail: "页面缺少 <title> 标签，搜索引擎无法识别页面主题。", status: "fail" });
+  } else if (titleText.length > 60) {
+    items.push({ id: "meta-title", category: "meta", label: "Title 标签", detail: `标题长度 ${titleText.length} 字符，建议控制在 60 字符以内以避免搜索结果截断。`, status: "warning" });
+  } else {
+    items.push({ id: "meta-title", category: "meta", label: "Title 标签", detail: `标题：「${titleText}」，长度 ${titleText.length} 字符，符合规范。`, status: "pass" });
+  }
+
+  // Meta Description
+  const descEl = doc.querySelector("meta[name='description']");
+  const descContent = descEl?.getAttribute("content") || "";
+  const ogDesc = doc.querySelector("meta[property='og:description']")?.getAttribute("content") || "";
+  if (!descContent) {
+    items.push({ id: "meta-desc", category: "meta", label: "Meta Description", detail: "缺少 meta description 标签，搜索引擎将自动截取页面内容作为摘要，可能影响点击率。", status: "fail" });
+  } else if (descContent.length < 50 || descContent.length > 160) {
+    items.push({ id: "meta-desc", category: "meta", label: "Meta Description", detail: `描述长度 ${descContent.length} 字符，建议在 50-160 字符之间以获得最佳搜索结果展示。`, status: "warning" });
+  } else {
+    items.push({ id: "meta-desc", category: "meta", label: "Meta Description", detail: `描述长度 ${descContent.length} 字符，符合最佳实践。`, status: "pass" });
+  }
+
+  // Canonical 标签
+  const canonical = doc.querySelector("link[rel='canonical']")?.getAttribute("href");
+  if (!canonical) {
+    items.push({ id: "meta-canonical", category: "meta", label: "Canonical 标签", detail: "缺少 canonical 标签，可能导致重复内容问题。建议添加 <link rel='canonical'> 指向规范 URL。", status: "warning" });
+  } else {
+    items.push({ id: "meta-canonical", category: "meta", label: "Canonical 标签", detail: `已设置 canonical: ${canonical}，有效防止重复内容。`, status: "pass" });
+  }
+
+  // Open Graph 标签
+  const ogTags = {
+    "og:title": ogTitle,
+    "og:description": ogDesc,
+    "og:image": doc.querySelector("meta[property='og:image']")?.getAttribute("content") || "",
+    "og:url": doc.querySelector("meta[property='og:url']")?.getAttribute("content") || "",
+    "og:type": doc.querySelector("meta[property='og:type']")?.getAttribute("content") || "",
+  };
+  const ogCount = Object.values(ogTags).filter((v) => v).length;
+  if (ogCount === 0) {
+    items.push({ id: "meta-og", category: "meta", label: "Open Graph 标签", detail: "未检测到任何 Open Graph 标签，社交分享时将无法正确展示预览图和摘要。", status: "fail" });
+  } else if (ogCount < 3) {
+    items.push({ id: "meta-og", category: "meta", label: "Open Graph 标签", detail: `检测到 ${ogCount}/5 个 OG 标签，建议补全 og:title、og:description、og:image、og:url、og:type 以获得完整社交分享体验。`, status: "warning" });
+  } else {
+    items.push({ id: "meta-og", category: "meta", label: "Open Graph 标签", detail: `检测到 ${ogCount}/5 个 OG 标签，社交分享预览配置完善。`, status: "pass" });
+  }
+
+  // Twitter Card 标签
+  const twitterCard = doc.querySelector("meta[name='twitter:card']")?.getAttribute("content") || "";
+  if (!twitterCard) {
+    items.push({ id: "meta-twitter", category: "meta", label: "Twitter Card 标签", detail: "缺少 Twitter Card 标签，Twitter/X 分享时无法生成卡片预览。", status: "warning" });
+  } else {
+    items.push({ id: "meta-twitter", category: "meta", label: "Twitter Card 标签", detail: `Twitter Card 类型: ${twitterCard}，分享预览配置正常。`, status: "pass" });
+  }
+
+  // ── 2. 内容质量检查 ──
+
+  // H1 标签
+  const h1List = doc.querySelectorAll("h1");
+  if (h1List.length === 0) {
+    items.push({ id: "content-h1", category: "content", label: "H1 标题", detail: "页面缺少 H1 标签，H1 是页面最重要的标题，对 SEO 至关重要。", status: "fail" });
+  } else if (h1List.length > 1) {
+    items.push({ id: "content-h1", category: "content", label: "H1 标题", detail: `检测到 ${h1List.length} 个 H1 标签，建议每页仅保留 1 个 H1 以明确页面主题。`, status: "warning" });
+  } else {
+    items.push({ id: "content-h1", category: "content", label: "H1 标题", detail: `H1 内容：「${h1List[0].textContent?.trim().slice(0, 50)}」，符合规范。`, status: "pass" });
+  }
+
+  // 标题层级
+  const h2List = doc.querySelectorAll("h2");
+  const h3List = doc.querySelectorAll("h3");
+  if (h2List.length === 0 && h3List.length === 0) {
+    items.push({ id: "content-headings", category: "content", label: "标题层级结构", detail: "未检测到 H2/H3 标签，缺乏结构化标题可能影响内容组织和 SEO 排名。", status: "warning" });
+  } else {
+    items.push({ id: "content-headings", category: "content", label: "标题层级结构", detail: `检测到 H2: ${h2List.length} 个，H3: ${h3List.length} 个，标题结构清晰。`, status: "pass" });
+  }
+
+  // 图片 alt 属性
+  const images = doc.querySelectorAll("img");
+  const imgsWithoutAlt = Array.from(images).filter((img) => !img.getAttribute("alt"));
+  if (images.length === 0) {
+    items.push({ id: "content-img-alt", category: "content", label: "图片 Alt 属性", detail: "页面未包含图片。", status: "pass" });
+  } else if (imgsWithoutAlt.length > 0) {
+    items.push({ id: "content-img-alt", category: "content", label: "图片 Alt 属性", detail: `${imgsWithoutAlt.length}/${images.length} 张图片缺少 alt 属性，影响图片搜索和无障碍体验。`, status: imgsWithoutAlt.length > images.length / 2 ? "fail" : "warning" });
+  } else {
+    items.push({ id: "content-img-alt", category: "content", label: "图片 Alt 属性", detail: `所有 ${images.length} 张图片均设置了 alt 属性。`, status: "pass" });
+  }
+
+  // 链接分析
+  const links = doc.querySelectorAll("a[href]");
+  const internalLinks = Array.from(links).filter((a) => {
+    const href = a.getAttribute("href") || "";
+    return href.startsWith("/") || href.startsWith("#") || href.startsWith(url);
+  });
+  const externalLinks = Array.from(links).filter((a) => {
+    const href = a.getAttribute("href") || "";
+    return href.startsWith("http") && !href.startsWith(url);
+  });
+  const linksWithoutText = Array.from(links).filter((a) => !a.textContent?.trim());
+  if (links.length === 0) {
+    items.push({ id: "content-links", category: "content", label: "链接分析", detail: "页面未包含任何链接，建议添加内部链接以改善站点结构。", status: "warning" });
+  } else if (linksWithoutText.length > 0) {
+    items.push({ id: "content-links", category: "content", label: "链接分析", detail: `共 ${links.length} 个链接（内部 ${internalLinks.length}，外部 ${externalLinks.length}），其中 ${linksWithoutText.length} 个链接缺少文字，影响 SEO 和无障碍。`, status: "warning" });
+  } else {
+    items.push({ id: "content-links", category: "content", label: "链接分析", detail: `共 ${links.length} 个链接（内部 ${internalLinks.length}，外部 ${externalLinks.length}），均有文字描述。`, status: "pass" });
+  }
+
+  // ── 3. 技术优化检查 ──
+
+  // Viewport / 移动端适配
+  const viewport = doc.querySelector("meta[name='viewport']")?.getAttribute("content") || "";
+  if (!viewport) {
+    items.push({ id: "tech-viewport", category: "technical", label: "移动端适配", detail: "缺少 viewport meta 标签，页面在移动设备上可能无法正确显示。这是 Google 移动优先索引的必需项。", status: "fail" });
+  } else {
+    items.push({ id: "tech-viewport", category: "technical", label: "移动端适配", detail: `viewport 配置正常，适配移动端浏览。`, status: "pass" });
+  }
+
+  // 结构化数据 JSON-LD
+  const jsonLdScripts = doc.querySelectorAll('script[type="application/ld+json"]');
+  if (jsonLdScripts.length === 0) {
+    items.push({ id: "tech-schema", category: "technical", label: "结构化数据 (Schema.org)", detail: "未检测到 JSON-LD 结构化数据，添加 Schema.org 标记有助于搜索引擎理解页面内容，获得富文本结果。", status: "warning" });
+  } else {
+    items.push({ id: "tech-schema", category: "technical", label: "结构化数据 (Schema.org)", detail: `检测到 ${jsonLdScripts.length} 个 JSON-LD 结构化数据块，有助于富文本搜索结果。`, status: "pass" });
+  }
+
+  // robots meta
+  const robotsMeta = doc.querySelector("meta[name='robots']")?.getAttribute("content") || "";
+  if (robotsMeta.toLowerCase().includes("noindex")) {
+    items.push({ id: "tech-robots", category: "technical", label: "Robots 索引指令", detail: `页面设置了 noindex 指令（${robotsMeta}），搜索引擎将不会索引此页面。`, status: "warning" });
+  } else {
+    items.push({ id: "tech-robots", category: "technical", label: "Robots 索引指令", detail: robotsMeta ? `robots meta: ${robotsMeta}，索引正常。` : "未设置 robots 限制，页面可被正常索引。", status: "pass" });
+  }
+
+  // lang 属性
+  const langAttr = doc.documentElement.getAttribute("lang") || "";
+  if (!langAttr) {
+    items.push({ id: "tech-lang", category: "technical", label: "语言声明 (lang)", detail: "缺少 <html lang> 属性，影响搜索引擎语言判断和无障碍体验。", status: "warning" });
+  } else {
+    items.push({ id: "tech-lang", category: "technical", label: "语言声明 (lang)", detail: `语言声明: lang="${langAttr}"，符合规范。`, status: "pass" });
+  }
+
+  // ── 4. 性能与体验检查 ──
+
+  // HTML 大小
+  const htmlSize = new TextEncoder().encode(html).length;
+  const htmlSizeKB = htmlSize / 1024;
+  if (htmlSizeKB > 500) {
+    items.push({ id: "perf-htmlsize", category: "performance", label: "HTML 体积", detail: `HTML 体积 ${htmlSizeKB.toFixed(1)} KB，过大可能影响加载速度。建议精简内联样式和脚本。`, status: "warning" });
+  } else {
+    items.push({ id: "perf-htmlsize", category: "performance", label: "HTML 体积", detail: `HTML 体积 ${htmlSizeKB.toFixed(1)} KB，在合理范围内。`, status: "pass" });
+  }
+
+  // 内联样式
+  const inlineStyles = doc.querySelectorAll("style");
+  const inlineStyleAttrs = Array.from(doc.querySelectorAll("[style]"));
+  if (inlineStyles.length > 3 || inlineStyleAttrs.length > 10) {
+    items.push({ id: "perf-inline-css", category: "performance", label: "内联样式", detail: `检测到 ${inlineStyles.length} 个 <style> 标签和 ${inlineStyleAttrs.length} 个内联 style 属性，建议提取为外部 CSS 文件。`, status: "warning" });
+  } else {
+    items.push({ id: "perf-inline-css", category: "performance", label: "内联样式", detail: `内联样式使用合理（${inlineStyles.length} 个 style 标签，${inlineStyleAttrs.length} 个 style 属性）。`, status: "pass" });
+  }
+
+  // 资源引用统计
+  const stylesheets = doc.querySelectorAll('link[rel="stylesheet"]');
+  const scripts = doc.querySelectorAll("script[src]");
+  const totalResources = stylesheets.length + scripts.length;
+  if (totalResources > 15) {
+    items.push({ id: "perf-resources", category: "performance", label: "外部资源数量", detail: `共 ${totalResources} 个外部资源（CSS ${stylesheets.length}，JS ${scripts.length}），请求过多可能影响加载速度。`, status: "warning" });
+  } else {
+    items.push({ id: "perf-resources", category: "performance", label: "外部资源数量", detail: `共 ${totalResources} 个外部资源（CSS ${stylesheets.length}，JS ${scripts.length}），数量合理。`, status: "pass" });
+  }
+
+  // ── 计算评分 ──
+  const passCount = items.filter((i) => i.status === "pass").length;
+  const warningCount = items.filter((i) => i.status === "warning").length;
+  const failCount = items.filter((i) => i.status === "fail").length;
+  const total = items.length;
+  const score = Math.round(((passCount + warningCount * 0.5) / total) * 100);
+
+  return {
+    score,
+    items,
+    summary: { pass: passCount, warning: warningCount, fail: failCount, total },
+  };
+}
 
 /**
  * 根据原始文本与项目配置，生成标准 llms.txt 内容
@@ -295,6 +709,16 @@ export default function HomePage() {
   const [config, setConfig] = useState<ProjectConfig>(DEFAULT_CONFIG);
   const [copySuccess, setCopySuccess] = useState(false);
 
+  // ── 网页抓取状态 ──
+  const [scrapeUrl, setScrapeUrl] = useState("");
+  const [scrapeStatus, setScrapeStatus] = useState<ScrapeStatus>("idle");
+  const [scrapeError, setScrapeError] = useState("");
+  const [scrapePreview, setScrapePreview] = useState("");
+
+  // ── SEO 审计状态 ──
+  const [seoReport, setSeoReport] = useState<SeoAuditReport | null>(null);
+  const [showSeoReport, setShowSeoReport] = useState(false);
+
   /** 是否有有效输入（用于控制右侧空状态） */
   const hasInput = rawText.trim().length > 0;
 
@@ -371,6 +795,91 @@ export default function HomePage() {
     setActiveTab(tab);
   }, []);
 
+  /** 网页抓取：通过 CORS 代理获取网页内容并转换为结构化文本 */
+  const handleScrape = useCallback(async () => {
+    const url = scrapeUrl.trim();
+    if (!url) {
+      setScrapeError("请输入网页地址");
+      setScrapeStatus("error");
+      return;
+    }
+
+    // 校验 URL 格式
+    let validUrl = url;
+    if (!/^https?:\/\//.test(validUrl)) {
+      validUrl = "https://" + validUrl;
+    }
+
+    try {
+      new URL(validUrl);
+    } catch {
+      setScrapeError("网址格式不正确，请检查后重试");
+      setScrapeStatus("error");
+      return;
+    }
+
+    setScrapeStatus("loading");
+    setScrapeError("");
+
+    // 依次尝试多个 CORS 代理
+    for (let i = 0; i < CORS_PROXIES.length; i++) {
+      try {
+        const proxyUrl = CORS_PROXIES[i](validUrl);
+        const response = await fetch(proxyUrl, {
+          headers: { Accept: "text/html, application/xhtml+xml" },
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        const html = await response.text();
+        if (!html || html.length < 100) {
+          throw new Error("返回内容为空");
+        }
+
+        // 解析 HTML 并提取结构化内容
+        const result = parseHtmlToContent(html);
+
+        if (!result.content || result.content.length < 10) {
+          throw new Error("未能提取有效内容");
+        }
+
+        // 自动填充项目配置
+        if (result.title) {
+          setConfig((prev) => ({ ...prev, projectName: result.title }));
+        }
+        if (result.description) {
+          setConfig((prev) => ({ ...prev, projectDescription: result.description }));
+        }
+        setConfig((prev) => ({ ...prev, baseUrl: validUrl }));
+
+        // 将抓取内容设为 rawText 并更新预览
+        setRawText(result.content);
+        setScrapePreview(result.content);
+        setScrapeStatus("success");
+
+        // 同时执行 SEO 审计
+        const report = runSeoAudit(html, validUrl);
+        setSeoReport(report);
+
+        return; // 成功则退出循环
+      } catch (err) {
+        // 如果不是最后一个代理，继续尝试下一个
+        if (i < CORS_PROXIES.length - 1) {
+          continue;
+        }
+        // 所有代理都失败
+        setScrapeError(
+          err instanceof Error
+            ? `抓取失败：${err.message}。部分网站可能限制访问，请尝试其他网址或使用「文本直接输入」。`
+            : "抓取失败，请稍后重试或使用「文本直接输入」"
+        );
+        setScrapeStatus("error");
+      }
+    }
+  }, [scrapeUrl]);
+
   // ── Tab 配置 ──
   const tabs: { id: InputTab; label: string }[] = [
     { id: "text", label: "文本直接输入" },
@@ -435,14 +944,334 @@ export default function HomePage() {
             </div>
 
             <div className="flex flex-1 flex-col p-5 sm:p-6">
-              {/* 未开放 Tab：可切换样式 + 占位提示 */}
-              {activeTab !== "text" && (
-                <div className="flex flex-1 flex-col items-center justify-center rounded-xl border border-dashed border-slate-200 bg-slate-50/60 px-6 py-16 text-center">
-                  <div className="mb-3 text-3xl opacity-60">
-                    {activeTab === "scrape" ? "🌐" : "📁"}
+              {/* 网页抓取 Tab */}
+              {activeTab === "scrape" && (
+                <div className="flex flex-1 flex-col">
+                  {/* URL 输入区 */}
+                  <div className="mb-5">
+                    <label
+                      htmlFor="scrape-url"
+                      className="mb-2 block text-sm font-medium text-slate-700"
+                    >
+                      网页地址
+                    </label>
+                    <div className="flex gap-2">
+                      <input
+                        id="scrape-url"
+                        type="text"
+                        value={scrapeUrl}
+                        onChange={(e) => {
+                          setScrapeUrl(e.target.value);
+                          setScrapeStatus("idle");
+                          setScrapeError("");
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            handleScrape();
+                          }
+                        }}
+                        placeholder="https://example.com/docs"
+                        className="flex-1 rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleScrape}
+                        disabled={scrapeStatus === "loading"}
+                        className="inline-flex shrink-0 items-center gap-2 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {scrapeStatus === "loading" ? (
+                          <>
+                            <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                            </svg>
+                            抓取中
+                          </>
+                        ) : (
+                          "开始抓取"
+                        )}
+                      </button>
+                    </div>
+                    <p className="mt-1.5 text-xs text-slate-400">
+                      输入文档页面地址，系统将自动提取正文内容并转换为 Markdown 格式
+                    </p>
                   </div>
+
+                  {/* 错误提示 */}
+                  {scrapeStatus === "error" && scrapeError && (
+                    <div className="mb-4 flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+                      <svg className="mt-0.5 h-4 w-4 shrink-0" viewBox="0 0 20 20" fill="currentColor">
+                        <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+                      </svg>
+                      <span>{scrapeError}</span>
+                    </div>
+                  )}
+
+                  {/* 成功提示 */}
+                  {scrapeStatus === "success" && (
+                    <div className="mb-4 flex items-start gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
+                      <svg className="mt-0.5 h-4 w-4 shrink-0" viewBox="0 0 20 20" fill="currentColor">
+                        <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                      </svg>
+                      <div>
+                        <p>抓取成功！已自动填充内容和项目配置。</p>
+                        <p className="mt-1 text-xs text-emerald-600">
+                          共提取 {scrapePreview.length} 字符，可在右侧查看生成的 llms.txt。
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* SEO 审计报告 */}
+                  {seoReport && scrapeStatus === "success" && (
+                    <div className="mb-5 overflow-hidden rounded-xl border border-slate-200 bg-white">
+                      {/* 报告头部：评分 + 展开按钮 */}
+                      <button
+                        type="button"
+                        onClick={() => setShowSeoReport(!showSeoReport)}
+                        className="flex w-full items-center justify-between px-5 py-4 text-left transition hover:bg-slate-50"
+                      >
+                        <div className="flex items-center gap-4">
+                          {/* 评分圆环 */}
+                          <div className="relative flex h-14 w-14 shrink-0 items-center justify-center">
+                            <svg className="h-14 w-14 -rotate-90" viewBox="0 0 56 56">
+                              <circle cx="28" cy="28" r="24" fill="none" stroke="currentColor" strokeWidth="4" className="text-slate-100" />
+                              <circle
+                                cx="28"
+                                cy="28"
+                                r="24"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="4"
+                                strokeLinecap="round"
+                                strokeDasharray={`${(seoReport.score / 100) * 150.8} 150.8`}
+                                className={
+                                  seoReport.score >= 80
+                                    ? "text-emerald-500"
+                                    : seoReport.score >= 60
+                                    ? "text-amber-500"
+                                    : "text-rose-500"
+                                }
+                              />
+                            </svg>
+                            <span className={`absolute text-sm font-bold ${
+                              seoReport.score >= 80
+                                ? "text-emerald-600"
+                                : seoReport.score >= 60
+                                ? "text-amber-600"
+                                : "text-rose-600"
+                            }`}>
+                              {seoReport.score}
+                            </span>
+                          </div>
+                          <div>
+                            <h3 className="text-sm font-semibold text-slate-800">SEO 审计报告</h3>
+                            <div className="mt-1 flex items-center gap-3 text-xs">
+                              <span className="text-emerald-600">通过 {seoReport.summary.pass}</span>
+                              <span className="text-amber-600">警告 {seoReport.summary.warning}</span>
+                              <span className="text-rose-600">失败 {seoReport.summary.fail}</span>
+                              <span className="text-slate-400">共 {seoReport.summary.total} 项</span>
+                            </div>
+                          </div>
+                        </div>
+                        <svg
+                          className={`h-5 w-5 text-slate-400 transition-transform ${showSeoReport ? "rotate-180" : ""}`}
+                          viewBox="0 0 20 20"
+                          fill="currentColor"
+                        >
+                          <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
+                        </svg>
+                      </button>
+
+                      {/* 展开的详细报告 */}
+                      {showSeoReport && (
+                        <div className="border-t border-slate-100 px-5 py-4">
+                          {/* 按类别分组 */}
+                          {(["meta", "content", "technical", "performance"] as SeoAuditCategory[]).map((cat) => {
+                            const catItems = seoReport.items.filter((i) => i.category === cat);
+                            if (catItems.length === 0) return null;
+                            return (
+                              <div key={cat} className="mb-5 last:mb-0">
+                                <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                                  {AUDIT_CATEGORY_LABELS[cat]}
+                                </h4>
+                                <div className="space-y-2">
+                                  {catItems.map((item) => (
+                                    <div
+                                      key={item.id}
+                                      className={`flex items-start gap-2.5 rounded-lg px-3 py-2.5 text-sm ${
+                                        item.status === "pass"
+                                          ? "bg-emerald-50/60"
+                                          : item.status === "warning"
+                                          ? "bg-amber-50/60"
+                                          : "bg-rose-50/60"
+                                      }`}
+                                    >
+                                      {/* 状态图标 */}
+                                      <span className="mt-0.5 shrink-0">
+                                        {item.status === "pass" ? (
+                                          <svg className="h-4 w-4 text-emerald-500" viewBox="0 0 20 20" fill="currentColor">
+                                            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                                          </svg>
+                                        ) : item.status === "warning" ? (
+                                          <svg className="h-4 w-4 text-amber-500" viewBox="0 0 20 20" fill="currentColor">
+                                            <path fillRule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 5a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 5zm0 9a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
+                                          </svg>
+                                        ) : (
+                                          <svg className="h-4 w-4 text-rose-500" viewBox="0 0 20 20" fill="currentColor">
+                                            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+                                          </svg>
+                                        )}
+                                      </span>
+                                      <div className="min-w-0 flex-1">
+                                        <p className="font-medium text-slate-700">{item.label}</p>
+                                        <p className="mt-0.5 text-xs leading-relaxed text-slate-500">{item.detail}</p>
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* 抓取内容预览 */}
+                  {scrapePreview && (
+                    <div className="mb-5 flex-1">
+                      <div className="mb-2 flex items-center justify-between">
+                        <label className="text-sm font-medium text-slate-700">
+                          抓取内容预览
+                        </label>
+                        <span className="text-xs text-slate-400">
+                          {scrapePreview.length} 字符
+                        </span>
+                      </div>
+                      <textarea
+                        value={rawText}
+                        onChange={(e) => {
+                          setRawText(e.target.value);
+                          setScrapePreview(e.target.value);
+                        }}
+                        rows={10}
+                        className="w-full resize-y rounded-xl border border-slate-200 bg-slate-50/50 px-4 py-3 font-mono text-sm leading-relaxed text-slate-800 focus:border-indigo-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                      />
+                    </div>
+                  )}
+
+                  {/* 空状态引导 */}
+                  {scrapeStatus === "idle" && !scrapePreview && (
+                    <div className="flex flex-1 flex-col items-center justify-center rounded-xl border border-dashed border-slate-200 bg-slate-50/60 px-6 py-16 text-center">
+                      <div className="mb-3 text-3xl opacity-60">🌐</div>
+                      <p className="text-sm font-medium text-slate-600">
+                        网页抓取
+                      </p>
+                      <p className="mt-2 max-w-xs text-xs leading-relaxed text-slate-400">
+                        输入文档页面地址，系统将通过代理抓取网页内容，自动提取正文并转换为 Markdown 格式。
+                      </p>
+                      <div className="mt-6 space-y-1.5 text-left text-xs text-slate-400">
+                        <p>支持功能：</p>
+                        <p>• 自动提取页面标题和描述</p>
+                        <p>• 将 HTML 转换为 Markdown 格式</p>
+                        <p>• 自动填充项目配置信息</p>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 项目配置区（抓取成功后显示） */}
+                  {(scrapeStatus === "success" || scrapePreview) && (
+                    <div className="space-y-4 border-t border-slate-100 pt-5">
+                      <h2 className="text-sm font-semibold text-slate-800">
+                        项目配置
+                      </h2>
+                      <div className="grid gap-4 sm:grid-cols-2">
+                        <div className="sm:col-span-2">
+                          <label
+                            htmlFor="scrape-project-name"
+                            className="mb-1 block text-xs font-medium text-slate-600"
+                          >
+                            项目名称
+                          </label>
+                          <input
+                            id="scrape-project-name"
+                            type="text"
+                            value={config.projectName}
+                            onChange={(e) =>
+                              updateConfig("projectName", e.target.value)
+                            }
+                            placeholder="例如：智能文档助手"
+                            className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                          />
+                        </div>
+                        <div className="sm:col-span-2">
+                          <label
+                            htmlFor="scrape-project-desc"
+                            className="mb-1 block text-xs font-medium text-slate-600"
+                          >
+                            项目描述
+                          </label>
+                          <input
+                            id="scrape-project-desc"
+                            type="text"
+                            value={config.projectDescription}
+                            onChange={(e) =>
+                              updateConfig("projectDescription", e.target.value)
+                            }
+                            placeholder="一句话概括项目用途"
+                            className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                          />
+                        </div>
+                        <div>
+                          <label
+                            htmlFor="scrape-base-url"
+                            className="mb-1 block text-xs font-medium text-slate-600"
+                          >
+                            站点根路径（可选）
+                          </label>
+                          <input
+                            id="scrape-base-url"
+                            type="url"
+                            value={config.baseUrl}
+                            onChange={(e) =>
+                              updateConfig("baseUrl", e.target.value)
+                            }
+                            placeholder="https://docs.example.com"
+                            className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                          />
+                        </div>
+                        <div>
+                          <label
+                            htmlFor="scrape-author"
+                            className="mb-1 block text-xs font-medium text-slate-600"
+                          >
+                            维护者（可选）
+                          </label>
+                          <input
+                            id="scrape-author"
+                            type="text"
+                            value={config.author}
+                            onChange={(e) =>
+                              updateConfig("author", e.target.value)
+                            }
+                            placeholder="团队或负责人"
+                            className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* 文件上传 Tab：占位提示 */}
+              {activeTab === "upload" && (
+                <div className="flex flex-1 flex-col items-center justify-center rounded-xl border border-dashed border-slate-200 bg-slate-50/60 px-6 py-16 text-center">
+                  <div className="mb-3 text-3xl opacity-60">📁</div>
                   <p className="text-sm font-medium text-slate-600">
-                    {activeTab === "scrape" ? "网页抓取" : "文件上传"}
+                    文件上传
                   </p>
                   <p className="mt-2 text-xs text-slate-400">
                     将在后续版本开放
