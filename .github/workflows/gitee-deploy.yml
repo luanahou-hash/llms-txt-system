@@ -1,0 +1,34 @@
+name: Deploy to Gitee Pages
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build project
+        run: npm run build
+
+      - name: Deploy to Gitee Pages
+        uses: yanglbme/gitee-pages-action@main
+        with:
+          gitee-username: ${{ secrets.GITEE_USERNAME }}
+          gitee-password: ${{ secrets.GITEE_PASSWORD }}
+          gitee-repo: genLLM/geo-llm-china
+          branch: gh-pages
+          directory: out
